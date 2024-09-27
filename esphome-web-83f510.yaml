@@ -1,0 +1,285 @@
+substitutions:
+  name: esphome-web-83f510
+  friendly_name: ESPHome Web 83f510
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  project:
+    name: esphome.web
+    version: dev
+  on_boot:
+    priority: -10
+    then:
+      - delay: 2s
+      - lambda: |-
+          id(tare_offset) = id(raw_weight)->state;
+
+esp32:
+  board: seeed_xiao_esp32c3
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  password: ""
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: "HighGadget"
+  password: "Nirvana108"
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Dummyscales Fallback Hotspot"
+    password: "YiGoo1Ful4VA"
+
+captive_portal:
+
+dashboard_import:
+  package_import_url: github://esphome/firmware/esphome-web/esp32c3.yaml@main
+  import_full_config: true
+
+esp32_improv:
+  authorizer: none
+
+web_server:
+
+i2c:
+  sda: GPIO6
+  scl: GPIO7
+  scan: true
+  frequency: 400kHz
+
+globals:
+  - id: tare_offset
+    type: float
+    initial_value: '0'
+
+  - id: calibration_factor
+    type: float
+    restore_value: yes
+    initial_value: '0.0001615'  # Исправленный начальный калибровочный коэффициент
+
+  - id: is_calibrating
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: last_published_weight
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_publish_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+  - id: sum_samples
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: current_sample_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: desired_sample_count
+    type: int
+    restore_value: no
+    initial_value: '10'
+
+  - id: last_published_raw_weight
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+sensor:
+  - platform: hx711
+    name: "Raw Weight"
+    id: raw_weight
+    internal: true  # Скрываем от Home Assistant
+    dout_pin: GPIO4
+    clk_pin: GPIO3
+    update_interval: 200ms
+    on_raw_value:
+      then:
+        - lambda: |-
+            // Получение текущего веса
+            float current_weight = id(raw_weight)->state;
+
+            // Переменные для хранения предыдущих значений
+            static float prev_weight1 = current_weight;
+            static float prev_weight2 = current_weight;
+            
+            // Проверка одиночного выброса: если текущее значение значительно отличается от предыдущих двух
+            if (fabs(current_weight - prev_weight1) > 1000 && fabs(current_weight - prev_weight2) > 1000) {
+              ESP_LOGW("filter", "Обнаружен одиночный выброс, пропускаем измерение: %f", current_weight);
+              // Обновляем предыдущие значения
+              prev_weight2 = prev_weight1;
+              prev_weight1 = current_weight;
+              return;
+            }
+
+            // Если измерение не выброс, продолжаем обработку
+            ESP_LOGI("filter", "Измерение принято: %f", current_weight);
+
+            // Обновляем предыдущие значения
+            prev_weight2 = prev_weight1;
+            prev_weight1 = current_weight;
+
+            // Вычисление разницы с последним опубликованным сырым весом
+            float difference = fabs(current_weight - id(last_published_raw_weight));
+
+            // Установка желаемого количества семплов на основе разницы
+            if (difference <= 100.0) {
+              id(desired_sample_count) = 24;
+            } else if (difference <= 500.0) {
+              id(desired_sample_count) = 20;
+            } else if (difference <= 1000.0) {
+              id(desired_sample_count) = 16;
+            } else if (difference <= 2000.0) {
+              id(desired_sample_count) = 8;
+            } else if (difference <= 4000.0) {
+              id(desired_sample_count) = 6;
+            } else if (difference <= 8000.0) {
+              id(desired_sample_count) = 5;
+            } else if (difference <= 16000.0) {
+              id(desired_sample_count) = 4;
+            } else if (difference <= 32000.0) {
+              id(desired_sample_count) = 3;
+            } else if (difference <= 64000.0) {
+              id(desired_sample_count) = 2;
+            } else {
+              id(desired_sample_count) = 1;
+            }
+
+            // Накопление семплов
+            id(sum_samples) += current_weight;
+            id(current_sample_count) += 1;
+
+            // Проверка, достигли ли мы необходимого количества семплов
+            if (id(current_sample_count) >= id(desired_sample_count)) {
+              // Вычисление среднего значения
+              float average_weight = id(sum_samples) / id(desired_sample_count);
+
+              // Сброс суммы и счётчика семплов
+              id(sum_samples) = 0;
+              id(current_sample_count) = 0;
+
+              // Режим калибровки
+              if (id(is_calibrating)) {
+                float adjusted_weight = average_weight - id(tare_offset);
+                if (adjusted_weight != 0) {
+                  id(calibration_factor) = 100.0 / adjusted_weight;
+                  ESP_LOGI("calibration", "Калибровка завершена. Коэффициент: %f", id(calibration_factor));
+                  id(is_calibrating) = false;
+                } else {
+                  ESP_LOGW("calibration", "Калибровка не удалась: adjusted_weight равно 0");
+                }
+              }
+
+              // Вычисление веса в граммах с учётом калибровочного коэффициента
+              float grams = (average_weight - id(tare_offset)) * id(calibration_factor);
+
+              // Автоматическая компенсация дрейфа
+              if (fabs(grams) > 0.01 && fabs(grams) <= 0.1) {
+                id(tare_offset) = average_weight;
+                ESP_LOGI("auto_tare", "Автоматическая коррекция. Новое смещение: %f", id(tare_offset));
+                grams = (average_weight - id(tare_offset)) * id(calibration_factor);
+              }
+
+              // Стабилизация отображения
+              if (grams > -0.02 && grams < 0.02) {
+                grams = 0.00;
+              }
+
+              // Определение необходимости публикации значения в Home Assistant
+              unsigned long now = millis();
+              float percentage_change = 0.0;
+              if (fabs(id(last_published_weight)) > 0.001) {
+                percentage_change = fabs(grams - id(last_published_weight)) / fabs(id(last_published_weight));
+              } else {
+                percentage_change = 1.0;
+              }
+
+              if ((now - id(last_publish_time)) >= 5000 || percentage_change >= 0.05) {
+                id(grams_weight)->publish_state(grams);
+                id(last_published_weight) = grams;
+                id(last_publish_time) = now;
+                id(last_published_raw_weight) = average_weight;
+              }
+
+              // Обновление отображения сырых данных
+              id(raw_weight_display)->publish_state(average_weight);
+            }
+
+  - platform: template
+    name: "Weight in Grams"
+    id: grams_weight
+    unit_of_measurement: "g"
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    name: "Raw Weight Display"
+    id: raw_weight_display
+    internal: true  # Скрываем от Home Assistant
+    unit_of_measurement: ""
+    accuracy_decimals: 0
+    update_interval: never
+
+
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO8
+      mode: INPUT_PULLUP
+    name: "Tare Button"
+    id: tare_button
+    filters:
+      - delayed_on: 50ms     # Фильтр дребезга: задержка включения
+      - delayed_off: 50ms    # Фильтр дребезга: задержка выключения
+    on_click:
+      - min_length: 50ms
+        max_length: 5000ms
+        then:
+          - lambda: |-
+              id(tare_offset) = id(raw_weight)->state;
+              ESP_LOGI("tare_button", "Кнопка 'Тара' нажата. Новое смещение: %f", id(tare_offset));
+      - min_length: 5000ms
+        max_length: 50000ms
+        then:
+          - lambda: |-
+              id(is_calibrating) = true;
+              ESP_LOGI("calibration", "Начата калибровка. Поместите гирю 100 г на весы.");
+
+display:
+  - platform: ssd1306_i2c
+    model: "SH1106 128x64"
+    address: 0x3C
+    update_interval: 1s
+    lambda: |-
+      if (id(is_calibrating)) {
+        it.printf(0, 4, id(NotoSansMono), "CALIBRATION 100 g");
+      } else {
+        it.printf(0, 16, id(NotoSansMono), "Weight: %.2f g", id(grams_weight)->state);
+        it.printf(0, 28, id(NotoSansMono), "Raw: %.0f", id(raw_weight_display)->state);
+        it.printf(0, 40, id(NotoSansMono), "Tare: %.0f", id(tare_offset));
+        it.printf(0, 52, id(NotoSansMono), "Samples: %d", id(desired_sample_count));
+      }
+
+font:
+  - file: "fonts/NotoSansMono-Regular.ttf"
+    id: NotoSansMono
+    size: 10  # Уменьшенный размер шрифта
