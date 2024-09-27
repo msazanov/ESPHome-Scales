@@ -15,17 +15,26 @@ esphome:
     then:
       - delay: 2s
       - lambda: |-
-          id(tare_offset) = id(raw_weight)->state;
+          id(is_calibrating) = true;
+          id(calibration_type) = 0;  // Zero calibration
+          id(calibration_in_progress) = true;
+          id(calibration_state) = 0;
+          id(display_page) = 3;  // Show calibration page during zero calibration
+          ESP_LOGI("calibration", "Zero Calibration started at boot.");
+
 
 esp32:
   board: seeed_xiao_esp32c3
   framework:
     type: arduino
 
-# Enable logging
 logger:
+  level: INFO
+  logs:
+    hx711: WARN
+    sensor: WARN
+    filter: WARN
 
-# Enable Home Assistant API
 api:
   password: ""
 
@@ -35,8 +44,6 @@ ota:
 wifi:
   ssid: "HighGadget"
   password: "Nirvana108"
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: "Dummyscales Fallback Hotspot"
     password: "YiGoo1Ful4VA"
@@ -66,22 +73,37 @@ globals:
   - id: calibration_factor
     type: float
     restore_value: yes
-    initial_value: '0.0001615'  # Исправленный начальный калибровочный коэффициент
+    initial_value: '1.0'  # Adjusted initial value for testing
 
   - id: is_calibrating
     type: bool
     restore_value: no
     initial_value: 'false'
 
-  - id: last_published_weight
+  - id: calibration_type
+    type: int
+    restore_value: no
+    initial_value: '0'  # 0 = calibration at 0g, 1 = calibration at 100g
+
+  - id: dev_mode
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: display_page
+    type: int
+    restore_value: no
+    initial_value: '1'  # 1 = normal page, 2 = dev page, 3 = calibration
+
+  - id: last_published_raw_weight
     type: float
     restore_value: no
     initial_value: '0'
 
-  - id: last_publish_time
-    type: unsigned long
+  - id: desired_sample_count
+    type: int
     restore_value: no
-    initial_value: '0'
+    initial_value: '10'
 
   - id: sum_samples
     type: float
@@ -93,54 +115,184 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  - id: desired_sample_count
-    type: int
+  - id: last_publish_time
+    type: unsigned long
     restore_value: no
-    initial_value: '10'
+    initial_value: '0'
 
-  - id: last_published_raw_weight
+  - id: last_published_weight
     type: float
     restore_value: no
     initial_value: '0'
+
+  # New globals for calibration state management
+  - id: calibration_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: calibration_start_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+  - id: calibration_sample_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: calibration_sum_samples
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: calibration_state
+    type: int
+    restore_value: no
+    initial_value: '0'  # 0 = Not calibrating, 1 = Waiting, 2 = Collecting samples
+
+  - id: cal_prev_weight1
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: cal_prev_weight2
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+font:
+  - file: "fonts/NotoSansMono-Regular.ttf"
+    id: NotoSansMonoSmall
+    size: 10
+  - file: "fonts/pricedow.ttf"
+    id: pricedow
+    size: 64
+
+
+switch:
+  - platform: template
+    name: "Developer Mode"
+    id: dev_mode_switch
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(dev_mode) = true;
+          id(display_page) = 2;
+          ESP_LOGI("display", "Switched to Developer mode, page: %d", id(display_page));
+          ESP_LOGI("display", "dev_mode is: %s", id(dev_mode) ? "true" : "false");
+    turn_off_action:
+      - lambda: |-
+          id(dev_mode) = false;
+          id(display_page) = 1;
+          ESP_LOGI("display", "Switched to Normal mode, page: %d", id(display_page));
+          ESP_LOGI("display", "dev_mode is: %s", id(dev_mode) ? "true" : "false");
+
 
 sensor:
   - platform: hx711
     name: "Raw Weight"
     id: raw_weight
-    internal: true  # Скрываем от Home Assistant
+    internal: true
     dout_pin: GPIO4
     clk_pin: GPIO3
     update_interval: 200ms
     on_raw_value:
       then:
         - lambda: |-
-            // Получение текущего веса
+            // Get current weight
             float current_weight = id(raw_weight)->state;
 
-            // Переменные для хранения предыдущих значений
+            // Static variables to store previous values
             static float prev_weight1 = current_weight;
             static float prev_weight2 = current_weight;
-            
-            // Проверка одиночного выброса: если текущее значение значительно отличается от предыдущих двух
+
+            // Check for single spike
             if (fabs(current_weight - prev_weight1) > 1000 && fabs(current_weight - prev_weight2) > 1000) {
-              ESP_LOGW("filter", "Обнаружен одиночный выброс, пропускаем измерение: %f", current_weight);
-              // Обновляем предыдущие значения
+              // Update previous values
               prev_weight2 = prev_weight1;
               prev_weight1 = current_weight;
+              ESP_LOGW("filter", "Spike detected, skipping measurement: current=%.0f, prev1=%.0f, prev2=%.0f", current_weight, prev_weight1, prev_weight2);
               return;
             }
 
-            // Если измерение не выброс, продолжаем обработку
-            ESP_LOGI("filter", "Измерение принято: %f", current_weight);
-
-            // Обновляем предыдущие значения
+            // Update previous values
             prev_weight2 = prev_weight1;
             prev_weight1 = current_weight;
 
-            // Вычисление разницы с последним опубликованным сырым весом
+            if (id(is_calibrating)) {
+              // Calibration logic
+              if (id(calibration_state) == 0) {
+                id(calibration_start_time) = millis();
+                id(calibration_state) = 1;
+                ESP_LOGI("calibration", "Waiting 1 second before starting calibration.");
+              } else if (id(calibration_state) == 1) {
+                if (millis() - id(calibration_start_time) >= 1000) {
+                  id(calibration_state) = 2;
+                  id(desired_sample_count) = 24;
+                  id(calibration_sample_count) = 0;
+                  id(calibration_sum_samples) = 0;
+                  // Initialize spike detection variables
+                  id(cal_prev_weight1) = current_weight;
+                  id(cal_prev_weight2) = current_weight;
+                  ESP_LOGI("calibration", "Starting calibration sample collection.");
+                }
+              } else if (id(calibration_state) == 2) {
+                // Spike detection during calibration
+                if (fabs(current_weight - id(cal_prev_weight1)) > 1000 && fabs(current_weight - id(cal_prev_weight2)) > 1000) {
+                  // Spike detected, reset calibration
+                  id(calibration_state) = 1;
+                  id(calibration_sample_count) = 0;
+                  id(calibration_sum_samples) = 0;
+                  ESP_LOGW("calibration", "Spike detected during calibration, restarting.");
+                  return;
+                }
+                // Update previous weights for spike detection
+                id(cal_prev_weight2) = id(cal_prev_weight1);
+                id(cal_prev_weight1) = current_weight;
+
+                // Accumulate samples
+                id(calibration_sum_samples) += current_weight;
+                id(calibration_sample_count) += 1;
+                ESP_LOGI("calibration", "Collecting calibration samples: %d/%d", id(calibration_sample_count), id(desired_sample_count));
+
+                if (id(calibration_sample_count) >= id(desired_sample_count)) {
+                  // Calculate average
+                  float average_weight = id(calibration_sum_samples) / id(desired_sample_count);
+
+                  if (id(calibration_type) == 0) {
+                    // Zero calibration
+                    id(tare_offset) = average_weight;
+                    ESP_LOGI("calibration", "Zero Calibration complete. Tare offset: %f", id(tare_offset));
+                  } else if (id(calibration_type) == 1) {
+                    // 100g calibration
+                    float adjusted_weight = id(tare_offset) - average_weight;
+                    if (adjusted_weight != 0) {
+                      id(calibration_factor) = 100.0 / adjusted_weight;
+                      ESP_LOGI("calibration", "Calibration complete. Factor: %f", id(calibration_factor));
+                    } else {
+                      ESP_LOGW("calibration", "Calibration failed: adjusted_weight is 0");
+                    }
+                  }
+                  // End calibration
+                  id(is_calibrating) = false;
+                  id(calibration_in_progress) = false;
+                  id(calibration_state) = 0;
+                  id(display_page) = 1;
+                  // Reset spike detection variables
+                  id(cal_prev_weight1) = current_weight;
+                  id(cal_prev_weight2) = current_weight;
+                }
+                return;
+              }
+              return;  // Prevent further processing during calibration
+            }
+
+            // Normal operation code
+            // Calculate difference with last published raw weight
             float difference = fabs(current_weight - id(last_published_raw_weight));
 
-            // Установка желаемого количества семплов на основе разницы
+            // Set desired sample count based on difference
             if (difference <= 100.0) {
               id(desired_sample_count) = 24;
             } else if (difference <= 500.0) {
@@ -163,47 +315,38 @@ sensor:
               id(desired_sample_count) = 1;
             }
 
-            // Накопление семплов
+            // Accumulate samples
             id(sum_samples) += current_weight;
             id(current_sample_count) += 1;
 
-            // Проверка, достигли ли мы необходимого количества семплов
+            // Check if required number of samples is reached
             if (id(current_sample_count) >= id(desired_sample_count)) {
-              // Вычисление среднего значения
+              // Calculate average value
               float average_weight = id(sum_samples) / id(desired_sample_count);
 
-              // Сброс суммы и счётчика семплов
+              // Reset sum and sample counter
               id(sum_samples) = 0;
               id(current_sample_count) = 0;
 
-              // Режим калибровки
-              if (id(is_calibrating)) {
-                float adjusted_weight = average_weight - id(tare_offset);
-                if (adjusted_weight != 0) {
-                  id(calibration_factor) = 100.0 / adjusted_weight;
-                  ESP_LOGI("calibration", "Калибровка завершена. Коэффициент: %f", id(calibration_factor));
-                  id(is_calibrating) = false;
-                } else {
-                  ESP_LOGW("calibration", "Калибровка не удалась: adjusted_weight равно 0");
-                }
-              }
+              // Calculate weight in grams considering calibration factor
+              float grams = (id(tare_offset) - average_weight) * id(calibration_factor);
 
-              // Вычисление веса в граммах с учётом калибровочного коэффициента
-              float grams = (average_weight - id(tare_offset)) * id(calibration_factor);
-
-              // Автоматическая компенсация дрейфа
+              // Automatic drift compensation
               if (fabs(grams) > 0.01 && fabs(grams) <= 0.1) {
                 id(tare_offset) = average_weight;
-                ESP_LOGI("auto_tare", "Автоматическая коррекция. Новое смещение: %f", id(tare_offset));
-                grams = (average_weight - id(tare_offset)) * id(calibration_factor);
+                ESP_LOGI("auto_tare", "Automatic correction. New offset: %.0f", id(tare_offset));
+                grams = (id(tare_offset) - average_weight) * id(calibration_factor);
               }
 
-              // Стабилизация отображения
+              // Stabilize display
               if (grams > -0.02 && grams < 0.02) {
                 grams = 0.00;
               }
 
-              // Определение необходимости публикации значения в Home Assistant
+              // Log all variables in one line
+              ESP_LOGI("measurement", "Weight: %.2f g, Raw: %.0f, Offset: %.0f, Samples: %d", grams, average_weight, id(tare_offset), id(desired_sample_count));
+
+              // Determine if we need to publish the value to Home Assistant
               unsigned long now = millis();
               float percentage_change = 0.0;
               if (fabs(id(last_published_weight)) > 0.001) {
@@ -219,7 +362,7 @@ sensor:
                 id(last_published_raw_weight) = average_weight;
               }
 
-              // Обновление отображения сырых данных
+              // Update raw data display
               id(raw_weight_display)->publish_state(average_weight);
             }
 
@@ -233,12 +376,10 @@ sensor:
   - platform: template
     name: "Raw Weight Display"
     id: raw_weight_display
-    internal: true  # Скрываем от Home Assistant
+    internal: true
     unit_of_measurement: ""
     accuracy_decimals: 0
     update_interval: never
-
-
 
 binary_sensor:
   - platform: gpio
@@ -246,40 +387,72 @@ binary_sensor:
       number: GPIO8
       mode: INPUT_PULLUP
     name: "Tare Button"
-    id: tare_button
-    filters:
-      - delayed_on: 50ms     # Фильтр дребезга: задержка включения
-      - delayed_off: 50ms    # Фильтр дребезга: задержка выключения
     on_click:
-      - min_length: 50ms
-        max_length: 5000ms
+      # 100g Calibration
+      - min_length: 6000ms
+        max_length: 60000ms
         then:
           - lambda: |-
-              id(tare_offset) = id(raw_weight)->state;
-              ESP_LOGI("tare_button", "Кнопка 'Тара' нажата. Новое смещение: %f", id(tare_offset));
-      - min_length: 5000ms
-        max_length: 50000ms
-        then:
-          - lambda: |-
+              ESP_LOGI("button", "100g Calibration Button Pressed");
               id(is_calibrating) = true;
-              ESP_LOGI("calibration", "Начата калибровка. Поместите гирю 100 г на весы.");
+              id(calibration_type) = 1;  // 100g calibration
+              id(calibration_in_progress) = true;
+              id(calibration_state) = 0;
+              id(display_page) = 3;  // Show calibration page during 100g calibration
+              ESP_LOGI("calibration", "Calibration started. Place 100g weight.");
+
+
+      # Zero Calibration
+      - min_length: 3000ms
+        max_length: 6000ms
+        then:
+          - lambda: |-
+              ESP_LOGI("button", "Zero Calibration Button Pressed");
+              id(is_calibrating) = true;
+              id(calibration_type) = 0;  // Zero calibration
+              id(calibration_in_progress) = true;
+              id(calibration_state) = 0;
+              id(display_page) = 3;  // Show calibration page during zero calibration
+              ESP_LOGI("calibration", "Zero Calibration started. Remove all weight.");
+
+      # Tare
+      - min_length: 50ms
+        max_length: 3000ms
+        then:
+          - lambda: |-
+              ESP_LOGI("button", "Tare Button Pressed");
+              id(tare_offset) = id(raw_weight)->state;
+              ESP_LOGI("tare_button", "Tare updated: %f", id(tare_offset));
+
+
 
 display:
   - platform: ssd1306_i2c
     model: "SH1106 128x64"
     address: 0x3C
-    update_interval: 1s
+    update_interval: 100ms
     lambda: |-
-      if (id(is_calibrating)) {
-        it.printf(0, 4, id(NotoSansMono), "CALIBRATION 100 g");
-      } else {
-        it.printf(0, 16, id(NotoSansMono), "Weight: %.2f g", id(grams_weight)->state);
-        it.printf(0, 28, id(NotoSansMono), "Raw: %.0f", id(raw_weight_display)->state);
-        it.printf(0, 40, id(NotoSansMono), "Tare: %.0f", id(tare_offset));
-        it.printf(0, 52, id(NotoSansMono), "Samples: %d", id(desired_sample_count));
+      it.clear();
+      if (id(display_page) == 1) {
+        it.printf(0, 0, id(pricedow), "%.2f g", id(grams_weight)->state);
+      } else if (id(display_page) == 2) {
+        it.printf(0, 0, id(NotoSansMonoSmall), "Weight: %.2f g", id(grams_weight)->state);
+        it.printf(0, 11, id(NotoSansMonoSmall), "Raw: %.0f", id(raw_weight_display)->state);
+        it.printf(0, 22, id(NotoSansMonoSmall), "Tare: %.0f", id(tare_offset));
+        it.printf(0, 33, id(NotoSansMonoSmall), "Samples: %d", id(desired_sample_count));
+      } else if (id(display_page) == 3) {
+        // Show calibration page during calibration
+        if (id(calibration_type) == 1) {
+          it.printf(0, 0, id(NotoSansMonoSmall), "Calibration 100g");
+        } else if (id(calibration_type) == 0) {
+          it.printf(0, 0, id(NotoSansMonoSmall), "Zero Calibration");
+        }
+        if (id(calibration_state) == 1) {
+          it.printf(0, 16, id(NotoSansMonoSmall), "Starting in 1s...");
+        } else if (id(calibration_state) == 2) {
+          it.printf(0, 16, id(NotoSansMonoSmall), "Calibrating...");
+          it.printf(0, 32, id(NotoSansMonoSmall), "Sample %d/%d", id(calibration_sample_count), id(desired_sample_count));
+        } else {
+          it.printf(0, 16, id(NotoSansMonoSmall), "Calibration Done");
+        }
       }
-
-font:
-  - file: "fonts/NotoSansMono-Regular.ttf"
-    id: NotoSansMono
-    size: 10  # Уменьшенный размер шрифта
