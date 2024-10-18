@@ -17,10 +17,18 @@ esphome:
       - lambda: |-
           id(is_calibrating) = true;
           id(calibration_type) = 0;  // Zero calibration
-          id(calibration_in_progress) = true;
           id(calibration_state) = 0;
           id(display_page) = 3;  // Show calibration page during zero calibration
           ESP_LOGI("calibration", "Zero Calibration started at boot.");
+      - lambda: |-
+          // Инициализация предыдущих весов для фильтра спайков
+          float initial_weight = id(raw_weight)->state;
+          id(prev_weight1) = initial_weight;
+          id(prev_weight2) = initial_weight;
+          ESP_LOGI("filter", "Initialized previous weights: prev1=%.0f, prev2=%.0f", id(prev_weight1), id(prev_weight2));
+
+
+
 
 
 esp32:
@@ -33,7 +41,11 @@ logger:
   logs:
     hx711: WARN
     sensor: WARN
-    filter: WARN
+    filter: INFO  # Изменено на INFO для более детального логирования
+    measurement: INFO  # Добавлено для логирования измерений
+    free_heap: INFO  # Добавлено для логирования свободной памяти
+
+
 
 api:
   password: ""
@@ -125,12 +137,7 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  # New globals for calibration state management
-  - id: calibration_in_progress
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
+  # Globals for calibration state management
   - id: calibration_start_time
     type: unsigned long
     restore_value: no
@@ -161,6 +168,20 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  # Globals for spike filtering
+  - id: prev_weight1
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: prev_weight2
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+
+
+
 font:
   - file: "fonts/NotoSansMono-Regular.ttf"
     id: NotoSansMonoSmall
@@ -188,7 +209,6 @@ switch:
           ESP_LOGI("display", "Switched to Normal mode, page: %d", id(display_page));
           ESP_LOGI("display", "dev_mode is: %s", id(dev_mode) ? "true" : "false");
 
-
 sensor:
   - platform: hx711
     name: "Raw Weight"
@@ -200,28 +220,34 @@ sensor:
     on_raw_value:
       then:
         - lambda: |-
-            // Get current weight
+            // Получаем текущее значение веса
             float current_weight = id(raw_weight)->state;
 
-            // Static variables to store previous values
-            static float prev_weight1 = current_weight;
-            static float prev_weight2 = current_weight;
+            // Логируем текущее значение
+            ESP_LOGI("measurement", "Current Raw Weight: %.0f", current_weight);
 
-            // Check for single spike
-            if (fabs(current_weight - prev_weight1) > 1000 && fabs(current_weight - prev_weight2) > 1000) {
-              // Update previous values
-              prev_weight2 = prev_weight1;
-              prev_weight1 = current_weight;
-              ESP_LOGW("filter", "Spike detected, skipping measurement: current=%.0f, prev1=%.0f, prev2=%.0f", current_weight, prev_weight1, prev_weight2);
+            // Логируем предыдущие значения
+            ESP_LOGI("filter", "Previous Weights: prev1=%.0f, prev2=%.0f", id(prev_weight1), id(prev_weight2));
+
+            // Проверка на спайк
+            float diff1 = fabs(current_weight - id(prev_weight1));
+            float diff2 = fabs(current_weight - id(prev_weight2));
+            ESP_LOGI("filter", "Differences: diff1=%.0f, diff2=%.0f", diff1, diff2);
+
+            if (diff1 > 1000 && diff2 > 1000) {
+              // Обнаружен спайк, пропускаем измерение
+              ESP_LOGW("filter", "Spike detected: current=%.0f, prev1=%.0f, prev2=%.0f", current_weight, id(prev_weight1), id(prev_weight2));
+              id(prev_weight2) = id(prev_weight1);
+              id(prev_weight1) = current_weight;
               return;
             }
 
-            // Update previous values
-            prev_weight2 = prev_weight1;
-            prev_weight1 = current_weight;
+            // Обновляем предыдущие значения
+            id(prev_weight2) = id(prev_weight1);
+            id(prev_weight1) = current_weight;
 
             if (id(is_calibrating)) {
-              // Calibration logic
+              // Логика калибровки
               if (id(calibration_state) == 0) {
                 id(calibration_start_time) = millis();
                 id(calibration_state) = 1;
@@ -232,40 +258,40 @@ sensor:
                   id(desired_sample_count) = 24;
                   id(calibration_sample_count) = 0;
                   id(calibration_sum_samples) = 0;
-                  // Initialize spike detection variables
+                  // Инициализируем переменные для обнаружения спайков
                   id(cal_prev_weight1) = current_weight;
                   id(cal_prev_weight2) = current_weight;
                   ESP_LOGI("calibration", "Starting calibration sample collection.");
                 }
               } else if (id(calibration_state) == 2) {
-                // Spike detection during calibration
+                // Обнаружение спайков во время калибровки
                 if (fabs(current_weight - id(cal_prev_weight1)) > 1000 && fabs(current_weight - id(cal_prev_weight2)) > 1000) {
-                  // Spike detected, reset calibration
+                  // Обнаружен спайк, перезапускаем калибровку
                   id(calibration_state) = 1;
                   id(calibration_sample_count) = 0;
                   id(calibration_sum_samples) = 0;
                   ESP_LOGW("calibration", "Spike detected during calibration, restarting.");
                   return;
                 }
-                // Update previous weights for spike detection
+                // Обновляем предыдущие веса для обнаружения спайков
                 id(cal_prev_weight2) = id(cal_prev_weight1);
                 id(cal_prev_weight1) = current_weight;
 
-                // Accumulate samples
+                // Накопление выборок
                 id(calibration_sum_samples) += current_weight;
                 id(calibration_sample_count) += 1;
                 ESP_LOGI("calibration", "Collecting calibration samples: %d/%d", id(calibration_sample_count), id(desired_sample_count));
 
                 if (id(calibration_sample_count) >= id(desired_sample_count)) {
-                  // Calculate average
+                  // Вычисляем среднее значение
                   float average_weight = id(calibration_sum_samples) / id(desired_sample_count);
 
                   if (id(calibration_type) == 0) {
-                    // Zero calibration
+                    // Калибровка на ноль
                     id(tare_offset) = average_weight;
                     ESP_LOGI("calibration", "Zero Calibration complete. Tare offset: %f", id(tare_offset));
                   } else if (id(calibration_type) == 1) {
-                    // 100g calibration
+                    // Калибровка на 100g
                     float adjusted_weight = id(tare_offset) - average_weight;
                     if (adjusted_weight != 0) {
                       id(calibration_factor) = 100.0 / adjusted_weight;
@@ -274,79 +300,71 @@ sensor:
                       ESP_LOGW("calibration", "Calibration failed: adjusted_weight is 0");
                     }
                   }
-                  // End calibration
+                  // Завершаем калибровку
                   id(is_calibrating) = false;
-                  id(calibration_in_progress) = false;
                   id(calibration_state) = 0;
                   id(display_page) = 1;
-                  // Reset spike detection variables
+                  // Сбрасываем переменные для обнаружения спайков
                   id(cal_prev_weight1) = current_weight;
                   id(cal_prev_weight2) = current_weight;
                 }
                 return;
               }
-              return;  // Prevent further processing during calibration
+              return;  // Предотвращаем дальнейшую обработку во время калибровки
             }
 
-            // Normal operation code
-            // Calculate difference with last published raw weight
+            // Код нормальной работы
+            // Вычисляем разницу с последним опубликованным сырым весом
             float difference = fabs(current_weight - id(last_published_raw_weight));
 
-            // Set desired sample count based on difference
-            if (difference <= 100.0) {
-              id(desired_sample_count) = 24;
-            } else if (difference <= 500.0) {
-              id(desired_sample_count) = 20;
-            } else if (difference <= 1000.0) {
-              id(desired_sample_count) = 16;
-            } else if (difference <= 2000.0) {
-              id(desired_sample_count) = 8;
-            } else if (difference <= 4000.0) {
-              id(desired_sample_count) = 6;
-            } else if (difference <= 8000.0) {
-              id(desired_sample_count) = 5;
-            } else if (difference <= 16000.0) {
-              id(desired_sample_count) = 4;
-            } else if (difference <= 32000.0) {
-              id(desired_sample_count) = 3;
-            } else if (difference <= 64000.0) {
-              id(desired_sample_count) = 2;
-            } else {
-              id(desired_sample_count) = 1;
+            // Оптимизированный блок установки desired_sample_count
+            const float thresholds[] = {100.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0, 32000.0, 64000.0};
+            const int sample_counts[] = {24, 20, 16, 8, 6, 5, 4, 3, 2};
+            const int num_thresholds = sizeof(thresholds) / sizeof(thresholds[0]);
+
+            int desired_sample = 1; // Значение по умолчанию
+
+            for (int i = 0; i < num_thresholds; i++) {
+              if (difference <= thresholds[i]) {
+                desired_sample = sample_counts[i];
+                break;
+              }
             }
 
-            // Accumulate samples
+            id(desired_sample_count) = desired_sample;
+
+            // Накопление выборок
             id(sum_samples) += current_weight;
             id(current_sample_count) += 1;
 
-            // Check if required number of samples is reached
+            // Проверяем, достигнуто ли необходимое количество выборок
             if (id(current_sample_count) >= id(desired_sample_count)) {
-              // Calculate average value
+              // Вычисляем среднее значение
               float average_weight = id(sum_samples) / id(desired_sample_count);
 
-              // Reset sum and sample counter
+              // Сбрасываем сумму и счетчик выборок
               id(sum_samples) = 0;
               id(current_sample_count) = 0;
 
-              // Calculate weight in grams considering calibration factor
+              // Вычисляем вес в граммах с учетом калибровочного фактора
               float grams = (id(tare_offset) - average_weight) * id(calibration_factor);
 
-              // Automatic drift compensation
+              // Автоматическая компенсация дрейфа
               if (fabs(grams) > 0.01 && fabs(grams) <= 0.1) {
                 id(tare_offset) = average_weight;
                 ESP_LOGI("auto_tare", "Automatic correction. New offset: %.0f", id(tare_offset));
                 grams = (id(tare_offset) - average_weight) * id(calibration_factor);
               }
 
-              // Stabilize display
+              // Стабилизация отображения
               if (grams > -0.02 && grams < 0.02) {
                 grams = 0.00;
               }
 
-              // Log all variables in one line
+              // Логирование всех переменных в одной строке
               ESP_LOGI("measurement", "Weight: %.2f g, Raw: %.0f, Offset: %.0f, Samples: %d", grams, average_weight, id(tare_offset), id(desired_sample_count));
 
-              // Determine if we need to publish the value to Home Assistant
+              // Определяем, нужно ли публиковать значение в Home Assistant
               unsigned long now = millis();
               float percentage_change = 0.0;
               if (fabs(id(last_published_weight)) > 0.001) {
@@ -362,9 +380,20 @@ sensor:
                 id(last_published_raw_weight) = average_weight;
               }
 
-              // Update raw data display
+              // Обновляем отображение сырых данных
               id(raw_weight_display)->publish_state(average_weight);
             }
+
+
+  - platform: template
+    name: "Free Heap Memory"
+    id: free_heap
+    unit_of_measurement: "bytes"
+    accuracy_decimals: 0
+    lambda: |-
+      return (float)ESP.getFreeHeap();
+    update_interval: 1s
+
 
   - platform: template
     name: "Weight in Grams"
@@ -396,11 +425,9 @@ binary_sensor:
               ESP_LOGI("button", "100g Calibration Button Pressed");
               id(is_calibrating) = true;
               id(calibration_type) = 1;  // 100g calibration
-              id(calibration_in_progress) = true;
               id(calibration_state) = 0;
               id(display_page) = 3;  // Show calibration page during 100g calibration
               ESP_LOGI("calibration", "Calibration started. Place 100g weight.");
-
 
       # Zero Calibration
       - min_length: 3000ms
@@ -410,7 +437,6 @@ binary_sensor:
               ESP_LOGI("button", "Zero Calibration Button Pressed");
               id(is_calibrating) = true;
               id(calibration_type) = 0;  // Zero calibration
-              id(calibration_in_progress) = true;
               id(calibration_state) = 0;
               id(display_page) = 3;  // Show calibration page during zero calibration
               ESP_LOGI("calibration", "Zero Calibration started. Remove all weight.");
